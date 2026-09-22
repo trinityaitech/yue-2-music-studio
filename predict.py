@@ -10,7 +10,6 @@ import uuid
 from typing import Optional
 from cog import BaseModel, BasePredictor, Input, Path
 import requests
-import websocket
 
 COMFY_HOST = "127.0.0.1:8188"
 COMFY_PYTHON = "/root/comfy_env/bin/python"
@@ -26,7 +25,11 @@ SHEETSAGE_PATH = (
     "/root/ComfyUI/models/audio_encoders/sheetsage2_bf16.safetensors"
 )
 
-DEFAULT_STYLE = "1980s japanese city pop, upbeat funk groove, 118 bpm, punchy gated snare, funky slap bassline, sparkling dx7 electric piano, crisp brass section stabs, bright chorus rhythm guitar, clear nostalgic female pop vocals"
+DEFAULT_STYLE = (
+    "1980s japanese city pop, upbeat funk groove, 118 bpm, punchy gated snare,"
+    " funky slap bassline, sparkling dx7 electric piano, crisp brass section"
+    " stabs, bright chorus rhythm guitar, clear nostalgic female pop vocals"
+)
 
 DEFAULT_LYRICS = """[intro - sparkling DX7 keys, bright brass stabs, funky slap bass]
 
@@ -41,6 +44,7 @@ Stay with me, stay with me, 夢の中で (yume no naka de)
 Dancing together under neon rain!
 Don't say goodbye.
 """
+
 
 class Output(BaseModel):
   audio: Path
@@ -202,7 +206,7 @@ class Predictor(BasePredictor):
           default=-1,
       ),
   ) -> Output:
-    """Runs Studio music generation with full CoT options and audio cover routing."""
+    """Runs Studio music generation with robust completion detection."""
     if seed < 0:
       seed = random.randint(0, 2**32 - 1)
     print(f"Executing Studio job with seed: {seed}")
@@ -221,16 +225,12 @@ class Predictor(BasePredictor):
 
       prompt["20"]["inputs"]["audio"] = ref_filename
       prompt["19"]["inputs"]["mode"] = cover_mode
-
-      # Feed SheetSage2 output into Node 22 (YuE2GenerateMusic)
       prompt["22"]["inputs"]["abc"] = ["19", 0]
 
-      # Remove text score planner (Node 23)
       if "23" in prompt:
         del prompt["23"]
     else:
       print(f"Running text-to-music pipeline with CoT mode: {cot}")
-      # Route Node 23 (YuE2GenerateABC) into Node 22
       prompt["22"]["inputs"]["abc"] = ["23", 0]
       if "23" in prompt:
         prompt["23"]["inputs"]["style"] = style
@@ -238,12 +238,11 @@ class Predictor(BasePredictor):
         prompt["23"]["inputs"]["mode"] = cot
         prompt["23"]["inputs"]["seed"] = seed
 
-      # Remove unused audio cover nodes
       for unused_node in ["18", "19", "20"]:
         if unused_node in prompt:
           del prompt[unused_node]
 
-    # Common parameters for Node 22 (YuE2GenerateMusic)
+    # Parameters for Node 22 (YuE2GenerateMusic)
     prompt["22"]["inputs"]["style"] = style
     prompt["22"]["inputs"]["lyrics"] = formatted_lyrics
     prompt["22"]["inputs"]["mode"] = cot
@@ -260,29 +259,51 @@ class Predictor(BasePredictor):
     prompt["8"]["inputs"]["cfg"] = cfg_scale
     prompt["8"]["inputs"]["seed"] = seed
 
-    # Submit job to ComfyUI
+    # Submit prompt to ComfyUI
     client_id = str(uuid.uuid4())
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
-
-    p = {"prompt": prompt, "client_id": client_id}
-    data = json.dumps(p).encode("utf-8")
+    payload = {"prompt": prompt, "client_id": client_id}
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"http://{COMFY_HOST}/prompt", data=data)
     response = json.loads(urllib.request.urlopen(req).read())
     prompt_id = response["prompt_id"]
 
-    while True:
-      out = ws.recv()
-      if isinstance(out, str):
-        message = json.loads(out)
-        if message["type"] == "executing":
-          data = message["data"]
-          if data["node"] is None and data["prompt_id"] == prompt_id:
-            break
-      else:
-        continue
-    ws.close()
+    # Robust Polling: Poll /history endpoint directly to prevent hanging WebSocket connections
+    max_wait = 720  # 12 minute safety ceiling
+    elapsed = 0
+    completed = False
+    history_outputs = {}
 
+    while elapsed < max_wait:
+      try:
+        hist_res = requests.get(
+            f"http://{COMFY_HOST}/history/{prompt_id}", timeout=3
+        )
+        if hist_res.status_code == 200:
+          hist_json = hist_res.json()
+          if prompt_id in hist_json:
+            completed = True
+            history_outputs = hist_json[prompt_id].get("outputs", {})
+            break
+      except Exception:
+        pass
+
+      time.sleep(2)
+      elapsed += 2
+
+    if not completed:
+      raise RuntimeError(
+          f"ComfyUI generation timed out after {max_wait} seconds."
+      )
+
+    # Retrieve generated ABC notation from Stage 1 (Node 23) if available
+    abc_text = ""
+    if "23" in history_outputs:
+      for val in history_outputs["23"].values():
+        if isinstance(val, list) and len(val) > 0 and isinstance(val[0], str):
+          abc_text = val[0]
+          break
+
+    # Locate generated audio file
     output_root = "/root/ComfyUI/output"
     found_audio = []
     found_text = []
@@ -290,36 +311,50 @@ class Predictor(BasePredictor):
     for root, _, files in os.walk(output_root):
       for f in files:
         full_path = os.path.join(root, f)
-        if f.endswith((".flac", ".wav", ".mp3")):
+        if f.endswith((".flac", ".wav", ".mp3", ".mpga")):
           found_audio.append(full_path)
         elif f.endswith((".abc", ".txt")):
           found_text.append(full_path)
 
     if not found_audio:
-      raise RuntimeError("No audio file was produced.")
+      raise RuntimeError(
+          "No audio file was produced in the ComfyUI output directory."
+      )
 
     latest_audio = max(found_audio, key=os.path.getmtime)
 
-    abc_text = ""
-    if found_text:
+    # Fallback score read from disk if history API didn't expose it
+    if not abc_text and found_text:
       latest_text = max(found_text, key=os.path.getmtime)
       with open(latest_text, "r", encoding="utf-8") as f:
         abc_text = f.read()
 
-    final_output = latest_audio
+    # Transcode audio format with explicit extension naming
     output_dir = os.path.dirname(latest_audio)
 
-    if audio_format == "mp3" and not latest_audio.endswith(".mp3"):
+    if audio_format == "mp3":
       final_output = os.path.join(output_dir, f"song_{prompt_id}.mp3")
       subprocess.run(
-          ["ffmpeg", "-y", "-i", latest_audio, "-b:a", "320k", final_output],
+          [
+              "ffmpeg",
+              "-y",
+              "-i",
+              latest_audio,
+              "-codec:a",
+              "libmp3lame",
+              "-b:a",
+              "320k",
+              final_output,
+          ],
           check=True,
       )
-    elif audio_format == "wav" and not latest_audio.endswith(".wav"):
+    elif audio_format == "wav":
       final_output = os.path.join(output_dir, f"song_{prompt_id}.wav")
       subprocess.run(
           ["ffmpeg", "-y", "-i", latest_audio, final_output],
           check=True,
       )
+    else:
+      final_output = latest_audio
 
     return Output(audio=Path(final_output), score_abc=abc_text)
