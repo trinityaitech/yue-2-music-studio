@@ -7,6 +7,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from typing import Optional
 from cog import BaseModel, BasePredictor, Input, Path
 import requests
 import websocket
@@ -27,7 +28,6 @@ SHEETSAGE_PATH = (
 
 DEFAULT_STYLE = "1980s japanese city pop, upbeat funk groove, 118 bpm, punchy gated snare, funky slap bassline, sparkling dx7 electric piano, crisp brass section stabs, bright chorus rhythm guitar, clear nostalgic female pop vocals"
 
-
 DEFAULT_LYRICS = """[intro - sparkling DX7 keys, bright brass stabs, funky slap bass]
 
 [verse]
@@ -42,7 +42,6 @@ Dancing together under neon rain!
 Don't say goodbye.
 """
 
-
 class Output(BaseModel):
   audio: Path
   score_abc: str
@@ -56,7 +55,6 @@ class Predictor(BasePredictor):
     os.makedirs(os.path.dirname(SHEETSAGE_PATH), exist_ok=True)
     os.makedirs("/root/ComfyUI/input", exist_ok=True)
 
-    # 1. Download YuE2 Model if missing
     if (
         not os.path.exists(YUE_CKPT_PATH)
         or os.path.getsize(YUE_CKPT_PATH) < 3_500_000_000
@@ -67,7 +65,6 @@ class Predictor(BasePredictor):
           check=True,
       )
 
-    # 2. Download SheetSage2 Audio Encoder if missing
     if (
         not os.path.exists(SHEETSAGE_PATH)
         or os.path.getsize(SHEETSAGE_PATH) < 1_200_000_000
@@ -85,7 +82,6 @@ class Predictor(BasePredictor):
           check=True,
       )
 
-    # 3. Boot background ComfyUI instance
     print("Starting ComfyUI Studio server in isolated virtualenv...")
     cmd = [
         COMFY_PYTHON,
@@ -122,31 +118,39 @@ class Predictor(BasePredictor):
 
   def predict(
       self,
-      reference_audio: Path = Input(
-          description=(
-              "(Optional) Upload reference song (MP3/WAV/FLAC) to create a"
-              " cover/remix. SheetSage2 transcribes its melody to ABC."
-          ),
-          default=None,
-      ),
-      cover_mode: str = Input(
-          description=(
-              "Cover transcription mode: 'melody' extracts the main lead/vocal"
-              " hook; 'full' extracts chords + harmony."
-          ),
-          choices=["melody", "full"],
-          default="melody",
-      ),
       style: str = Input(
           description="Genre, instruments, mood, tempo, vocal character",
           default=DEFAULT_STYLE,
       ),
       lyrics: str = Input(
           description=(
-              "Song lyrics or bracketed musical structure tags ([intro], [solo],"
-              " etc.)"
+              "Song lyrics or bracketed musical structure tags ([verse],"
+              " [chorus], etc.)"
           ),
           default=DEFAULT_LYRICS,
+      ),
+      cot: str = Input(
+          description=(
+              "Symbolic planning mode: 'full' (chords+melody), 'melody' (melody"
+              " only), 'off' (direct synthesis without score planning)"
+          ),
+          choices=["full", "melody", "off"],
+          default="full",
+      ),
+      reference_audio: Optional[Path] = Input(
+          description=(
+              "(Optional) Upload an audio file (MP3/WAV) to use as a cover/remix"
+              " source. Leave blank for standard text-to-music."
+          ),
+          default=None,
+      ),
+      cover_mode: str = Input(
+          description=(
+              "If reference audio is provided: 'melody' extracts lead vocal"
+              " hook; 'full' extracts chords + harmony."
+          ),
+          choices=["melody", "full"],
+          default="melody",
       ),
       audio_format: str = Input(
           description="Audio output format",
@@ -154,19 +158,13 @@ class Predictor(BasePredictor):
           default="mp3",
       ),
       cfg_scale: float = Input(
-          description=(
-              "Classifier-Free Guidance. 1.0 = fastest/cheapest single-pass; 1.2"
-              " - 1.5 = stronger prompt adherence."
-          ),
+          description="Text prompt guidance scale (1.0 to 1.5 recommended)",
           ge=1.0,
           le=2.5,
           default=1.2,
       ),
       repetition_penalty: float = Input(
-          description=(
-              "Penalizes repetitive vocal phrases. Increase to 1.25 - 1.35 if"
-              " vocals loop."
-          ),
+          description="Penalizes repetitive vocal loops. Increase if needed.",
           ge=1.0,
           le=2.0,
           default=1.20,
@@ -204,66 +202,65 @@ class Predictor(BasePredictor):
           default=-1,
       ),
   ) -> Output:
-    """Runs Studio music generation with dynamic SheetSage2 cover routing."""
+    """Runs Studio music generation with full CoT options and audio cover routing."""
     if seed < 0:
       seed = random.randint(0, 2**32 - 1)
     print(f"Executing Studio job with seed: {seed}")
 
     formatted_lyrics = lyrics.replace("\\n", "\n").strip()
 
-    # Load base studio graph
     with open("workflow_api.json", "r", encoding="utf-8") as f:
       prompt = json.load(f)
 
-    # --- DYNAMIC ROUTING BRANCH ---
+    # DYNAMIC ROUTING: Audio Cover vs Text Generation
     if reference_audio and os.path.exists(str(reference_audio)):
-      print("Reference audio detected. Activating SheetSage2 Cover pipeline...")
-      # Stage audio file in ComfyUI input folder
+      print("Reference audio detected. Routing through SheetSage2...")
       ref_filename = f"ref_{uuid.uuid4().hex[:8]}.wav"
       ref_dest = os.path.join("/root/ComfyUI/input", ref_filename)
       shutil.copyfile(str(reference_audio), ref_dest)
 
-      # Configure Node 20 (LoadAudio) & Node 19 (SheetSage2AudioToABC)
       prompt["20"]["inputs"]["audio"] = ref_filename
       prompt["19"]["inputs"]["mode"] = cover_mode
 
-      # Route SheetSage2 ABC output directly into Node 22 (YuE2GenerateMusic)
+      # Feed SheetSage2 output into Node 22 (YuE2GenerateMusic)
       prompt["22"]["inputs"]["abc"] = ["19", 0]
 
-      # Remove Node 23 (Text ABC planner) so it doesn't run unnecessarily
+      # Remove text score planner (Node 23)
       if "23" in prompt:
         del prompt["23"]
     else:
-      print("No reference audio. Running standard text-to-music pipeline...")
+      print(f"Running text-to-music pipeline with CoT mode: {cot}")
       # Route Node 23 (YuE2GenerateABC) into Node 22
       prompt["22"]["inputs"]["abc"] = ["23", 0]
       if "23" in prompt:
         prompt["23"]["inputs"]["style"] = style
         prompt["23"]["inputs"]["lyrics"] = formatted_lyrics
+        prompt["23"]["inputs"]["mode"] = cot
         prompt["23"]["inputs"]["seed"] = seed
 
-      # Delete unused audio cover nodes so ComfyUI doesn't execute them
+      # Remove unused audio cover nodes
       for unused_node in ["18", "19", "20"]:
         if unused_node in prompt:
           del prompt[unused_node]
 
-    # Configure Node 22 (YuE2GenerateMusic)
+    # Common parameters for Node 22 (YuE2GenerateMusic)
     prompt["22"]["inputs"]["style"] = style
     prompt["22"]["inputs"]["lyrics"] = formatted_lyrics
+    prompt["22"]["inputs"]["mode"] = cot
     prompt["22"]["inputs"]["max_duration"] = max_duration
     prompt["22"]["inputs"]["temperature"] = temperature
     prompt["22"]["inputs"]["repetition_penalty"] = repetition_penalty
     prompt["22"]["inputs"]["cfg_scale"] = cfg_scale
     prompt["22"]["inputs"]["seed"] = seed
 
-    # Configure Node 8 (KSampler)
+    # Parameters for Node 8 (KSampler)
     prompt["8"]["inputs"]["steps"] = steps
     prompt["8"]["inputs"]["sampler_name"] = sampler_name
     prompt["8"]["inputs"]["scheduler"] = scheduler
     prompt["8"]["inputs"]["cfg"] = cfg_scale
     prompt["8"]["inputs"]["seed"] = seed
 
-    # Submit job to local ComfyUI instance
+    # Submit job to ComfyUI
     client_id = str(uuid.uuid4())
     ws = websocket.WebSocket()
     ws.connect(f"ws://{COMFY_HOST}/ws?clientId={client_id}")
@@ -274,7 +271,6 @@ class Predictor(BasePredictor):
     response = json.loads(urllib.request.urlopen(req).read())
     prompt_id = response["prompt_id"]
 
-    # Wait for completion
     while True:
       out = ws.recv()
       if isinstance(out, str):
@@ -287,7 +283,6 @@ class Predictor(BasePredictor):
         continue
     ws.close()
 
-    # Discover generated audio
     output_root = "/root/ComfyUI/output"
     found_audio = []
     found_text = []
@@ -311,7 +306,6 @@ class Predictor(BasePredictor):
       with open(latest_text, "r", encoding="utf-8") as f:
         abc_text = f.read()
 
-    # Transcode audio format
     final_output = latest_audio
     output_dir = os.path.dirname(latest_audio)
 
@@ -324,7 +318,8 @@ class Predictor(BasePredictor):
     elif audio_format == "wav" and not latest_audio.endswith(".wav"):
       final_output = os.path.join(output_dir, f"song_{prompt_id}.wav")
       subprocess.run(
-          ["ffmpeg", "-y", "-i", latest_audio, final_output], check=True
+          ["ffmpeg", "-y", "-i", latest_audio, final_output],
+          check=True,
       )
 
     return Output(audio=Path(final_output), score_abc=abc_text)
