@@ -1,0 +1,44 @@
+name: Build and Push Studio to Replicate
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cog.yaml"
+      - "predict.py"
+      - "workflow_api.json"
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    name: Cog Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Quick Disk Cleanup
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx Cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ hashFiles('cog.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Setup Cog
+        uses: replicate/setup-cog@v2
+        with:
+          token: ${{ secrets.REPLICATE_API_TOKEN }}
+          cog-version: "v0.22.0"
+
+      - name: Push Model to Replicate
+        run: |
+          cog push r8.im/trinityaitech/yue-2-music-studio
