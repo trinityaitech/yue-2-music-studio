@@ -206,7 +206,7 @@ class Predictor(BasePredictor):
           default=-1,
       ),
   ) -> Output:
-    """Runs Studio music generation with robust completion detection."""
+    """Runs Studio music generation with dual-stage score extraction and audio cover routing."""
     if seed < 0:
       seed = random.randint(0, 2**32 - 1)
     print(f"Executing Studio job with seed: {seed}")
@@ -216,8 +216,10 @@ class Predictor(BasePredictor):
     with open("workflow_api.json", "r", encoding="utf-8") as f:
       prompt = json.load(f)
 
-    # DYNAMIC ROUTING: Audio Cover vs Text Generation
-    if reference_audio and os.path.exists(str(reference_audio)):
+    # 1. Dynamic Routing: Audio Cover vs Text Generation
+    is_cover = bool(reference_audio and os.path.exists(str(reference_audio)))
+
+    if is_cover:
       print("Reference audio detected. Routing through SheetSage2...")
       ref_filename = f"ref_{uuid.uuid4().hex[:8]}.wav"
       ref_dest = os.path.join("/root/ComfyUI/input", ref_filename)
@@ -259,7 +261,7 @@ class Predictor(BasePredictor):
     prompt["8"]["inputs"]["cfg"] = cfg_scale
     prompt["8"]["inputs"]["seed"] = seed
 
-    # Submit prompt to ComfyUI
+    # 2. Submit prompt to ComfyUI
     client_id = str(uuid.uuid4())
     payload = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(payload).encode("utf-8")
@@ -267,8 +269,8 @@ class Predictor(BasePredictor):
     response = json.loads(urllib.request.urlopen(req).read())
     prompt_id = response["prompt_id"]
 
-    # Robust Polling: Poll /history endpoint directly to prevent hanging WebSocket connections
-    max_wait = 720  # 12 minute safety ceiling
+    # 3. Poll ComfyUI history endpoint until execution completes
+    max_wait = 720  # 12-minute safety ceiling
     elapsed = 0
     completed = False
     history_outputs = {}
@@ -280,9 +282,14 @@ class Predictor(BasePredictor):
         )
         if hist_res.status_code == 200:
           hist_json = hist_res.json()
-          if prompt_id in hist_json:
+          # Handle both /history/{id} and /history formats
+          data = hist_json.get(prompt_id, hist_json)
+
+          # When ComfyUI finishes, 'outputs' is populated
+          if "outputs" in data and data["outputs"]:
             completed = True
-            history_outputs = hist_json[prompt_id].get("outputs", {})
+            history_outputs = data["outputs"]
+            print(f"ComfyUI completed generation in {elapsed}s.")
             break
       except Exception:
         pass
@@ -295,15 +302,17 @@ class Predictor(BasePredictor):
           f"ComfyUI generation timed out after {max_wait} seconds."
       )
 
-    # Retrieve generated ABC notation from Stage 1 (Node 23) if available
+    # 4. Extract generated ABC notation
     abc_text = ""
-    if "23" in history_outputs:
-      for val in history_outputs["23"].values():
+    target_node = "19" if is_cover else "23"
+
+    if target_node in history_outputs:
+      for val in history_outputs[target_node].values():
         if isinstance(val, list) and len(val) > 0 and isinstance(val[0], str):
           abc_text = val[0]
           break
 
-    # Locate generated audio file
+    # 5. Locate generated audio file in ComfyUI output directory
     output_root = "/root/ComfyUI/output"
     found_audio = []
     found_text = []
@@ -311,41 +320,29 @@ class Predictor(BasePredictor):
     for root, _, files in os.walk(output_root):
       for f in files:
         full_path = os.path.join(root, f)
-        if f.endswith((".flac", ".wav", ".mp3", ".mpga")):
+        if f.endswith((".flac", ".wav", ".mp3")):
           found_audio.append(full_path)
         elif f.endswith((".abc", ".txt")):
           found_text.append(full_path)
 
     if not found_audio:
-      raise RuntimeError(
-          "No audio file was produced in the ComfyUI output directory."
-      )
+      raise RuntimeError("No audio file was produced.")
 
     latest_audio = max(found_audio, key=os.path.getmtime)
 
-    # Fallback score read from disk if history API didn't expose it
+    # Fallback to disk read for ABC score if history dictionary was sparse
     if not abc_text and found_text:
       latest_text = max(found_text, key=os.path.getmtime)
       with open(latest_text, "r", encoding="utf-8") as f:
         abc_text = f.read()
 
-    # Transcode audio format with explicit extension naming
+    # 6. Transcode audio format
     output_dir = os.path.dirname(latest_audio)
 
     if audio_format == "mp3":
       final_output = os.path.join(output_dir, f"song_{prompt_id}.mp3")
       subprocess.run(
-          [
-              "ffmpeg",
-              "-y",
-              "-i",
-              latest_audio,
-              "-codec:a",
-              "libmp3lame",
-              "-b:a",
-              "320k",
-              final_output,
-          ],
+          ["ffmpeg", "-y", "-i", latest_audio, "-b:a", "320k", final_output],
           check=True,
       )
     elif audio_format == "wav":
